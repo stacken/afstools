@@ -1,0 +1,126 @@
+#!/bin/bash
+
+PATH=/usr/afsws/bin:$PATH ; export PATH
+
+function usage () {
+  echo Usage: $0 volume fromserver frompartition toserver topartition; exit 1;
+}
+
+localauth=""
+
+if [ $# != 5 ];
+then
+  if [ $# != 6 ] ; then
+    usage
+  else
+    case "$6" in 
+	-loc*)
+	    localauth=$6
+	    ;;
+	    *)
+	    usage
+	    ;;
+    esac
+  fi
+fi
+volume=$1
+volbase=`basename $volume .readonly`
+fromserver=$2
+frompart=$3
+toserver=$4
+topart=$5
+verbose="-verbose"
+volcache=/tmp/move-volume.$$
+
+rm -f $volcache
+#vos listvol $fromserver $frompart $localauth > $volcache
+vos exa $volbase > $volcache
+
+echo ""
+echo "# MOVING $volume FROM $fromserver:$frompart TO $toserver:$topart"
+echo ""
+# ```
+if awk '$5 == "Backup" { if ($6 == "0") exit 1; else exit 0}' $volcache > /dev/null ; then
+  echo ""
+  echo "# Backup of $volume exists ==> must remember make a new backup ..."
+  echo ""
+  dobackup=true
+fi
+
+volumesize=`awk '$5 == "K" && $6 == "On-line" { print $4 }' $volcache`
+starttime=`perl -e 'print time(),"\n"'`
+
+function movereadonly () {
+  # First add one more so that we never have one too little
+  echo "------"
+  echo vos addsite $toserver $topart $volbase $verbose $localauth
+  echo "------"
+  if vos addsite $toserver $topart $volbase $verbose $localauth 2>/tmp/rocopy$$ ; then
+      : ok
+  else
+      if grep "already exists" /tmp/rocopy$$ ; then
+	  : ok
+      else
+	  exit 1
+      fi
+  fi
+  rm /tmp/rocopy$$ 
+  vos rele $volbase $verbose $localauth || exit 1
+  echo "------"
+  echo vos remove $fromserver $frompart $volbase.readonly $verbose $localauth
+  echo "------"
+  vos remove $fromserver $frompart $volbase.readonly $verbose $localauth || exit 1
+  echo "------"
+  readonlymoved=true
+}
+
+function movereadwrite () {
+  echo "------"
+  echo vos move $volume $fromserver $frompart $toserver $topart $verbose $localauth
+  echo "------"
+  vos move $volume $fromserver $frompart $toserver $topart $verbose $localauth || exit 1
+  echo "------"
+  readwritemoved=true
+}
+
+if [ $volume = $volbase.readonly ] ; then
+  # We were asked to move the RO copy.
+  # But we want to move both, so make two steps.
+  rwline=`awk '$1 == "server" && $3 == "partition" && $5 == "RO" && $2 == "'$fromserver'" && $4 == "'$frompart'" {sub(/RO/,"RW",$5); print}' $volcache`
+  if test "$rwline" && grep "$rwline" $volcache > /dev/null ; then
+      #we have both RW and RO, move RW first
+      volume=$volbase
+      movereadwrite
+      # undo name change
+      volume=$volbase.readonly
+  fi
+  movereadonly
+else
+  # this not a RO, probably a RW
+  movereadwrite
+  roline=`awk '$1 == "server" && $3 == "partition" && $5 == "RW" {sub(/RW/,"RO",$5); print}' $volcache`
+  if test "$roline" && grep "$roline" $volcache > /dev/null ; then
+      #we have both RW and RO
+      movereadonly
+  fi
+fi
+
+if echo $dobackup | grep true > /dev/null && echo $readwritemoved | grep true > /dev/null ; then
+	echo "------"
+	echo vos backup $volbase $localauth
+	echo "------"
+	vos backup $volbase $localauth | sed 's/^/# /' || exit 1
+fi
+
+if echo $readonlymoved | grep true > /dev/null ; then
+ : "Don't remenber if there was something more to do ;)"
+fi
+
+# Statistics
+echo -n "------ Speed was "
+vos exa $volbase -format | awk '$1 == "name" || $1 == "filecount" || $1 == "diskused" {printf " %s ",$0}'
+perl -e '$diff=time()-'$starttime'+0.0; $diff=1 if $diff == 0; print " ",'$volumesize'/$diff," kbytes/sec\n"'
+
+rm -f $volcache
+echo "------ $volume done"
+
